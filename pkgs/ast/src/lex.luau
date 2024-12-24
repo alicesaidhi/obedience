@@ -14,9 +14,13 @@ export type TokenKindRest =
     | ")"
     | "."
     | ","
+    | "\n"
 
     | "{"
     | "}"
+
+    | "whitespace"
+    | "comment"
     
     | "fn"
     | "true"
@@ -65,6 +69,7 @@ local function lex(input: buffer)
     local len = buffer.len(input)
 
     local function peek(): number
+        if pos == len then return 0 end
 		return buffer.readu8(input, pos) :: any
 	end
         
@@ -78,6 +83,7 @@ local function lex(input: buffer)
         end
 
         bump()
+        return peek()
     end
 
     local function bump_peek()
@@ -85,9 +91,8 @@ local function lex(input: buffer)
         return peek()
     end
 
-
     local function is_whitespace(c: number): boolean
-		return c == char(" ") or c == char("\t") or c == char("\n") or c == char("\r")
+		return c == char(" ") or c == char("\t") or c == char("\r")
 	end
 
 	local function is_digit(c: number): boolean
@@ -181,6 +186,8 @@ local function lex(input: buffer)
 			text = buffer.readstring(input, start + 2, pos - start - 2) :: string
 		end
 
+        text = string.gsub(text, "_", "")
+
 		if tonumber(text, base) then
 			return "number"
 		else
@@ -189,17 +196,21 @@ local function lex(input: buffer)
 	end
 
     local function read_kind(): TokenKindRest | TokenKindText
-        local c: number = bump_peek()
-
+        local c: number = peek()
+        
         if c == 0 then
             return "eof"
         end
 
-        while is_whitespace(c) do
-            c = bump_peek()
-        end
-
-        if is_alpha(c) then
+        if c == char("#") then
+            while c ~= char("\n") do
+                bump_any()
+            end
+            return "comment"
+        elseif is_whitespace(c) then
+            bump()
+            return "whitespace"
+        elseif is_alpha(c) then
             local start = pos
 
             repeat
@@ -226,7 +237,7 @@ local function lex(input: buffer)
 
             repeat
                 c = bump_peek()
-            until not (is_alpha(c) or is_digit(c))
+            until not (c and is_alpha(c) or c and is_digit(c))
 
             local value = buffer.readstring(input, start, pos - start)
 
@@ -242,7 +253,7 @@ local function lex(input: buffer)
 
             return "variable"
         elseif c == char("\"") then
-
+            return quoted_string()
         elseif c == char(".") then
             c = peek()
 
@@ -250,58 +261,73 @@ local function lex(input: buffer)
 				pos -= 1
 				return number()
 			else
+                bump()
 				return "."
 			end
         elseif c == char("=") then
+            bump()
             return "="
         elseif c == char("[") then
+            bump()
             return "["
         elseif c == char("]") then
+            bump()
             return "]"
         elseif c == char("{") then
+            bump()
             return "{"
         elseif c == char("}") then
+            bump()
             return "}"
         elseif c == char("(") then
+            bump()
             return "("
         elseif c == char(")") then
+            bump()
             return ")"
         elseif c == char(",") then
+            bump()
             return ","
+        elseif c == char("\n") then
+            bump_any()
+            return "\n"
         end
 
         return "error"
     end
 
     local function next_token(): Token
-        while true do
-            local start = pos
-			local kind = read_kind()
+        local start = pos
+        local kind = read_kind()
+        
+        while kind == "whitespace" or kind == "comment" do
+            start = pos
+            kind = read_kind()
+        end
 
-			if
-                kind == "error"
-                or kind == "identifier"
-                or kind == "number"
-                or kind == "variable"
-                or kind == "string"
-            then
-                return {
-                    kind = kind,
-                    text = buffer.readstring(input, start, pos - start),
-                    span = vector.create(start, pos, 0),
-                }
-            else
-                return {
-                    kind = kind,
-                    span = vector.create(start, pos, 0),
-                }
-            end
-		end
+        if
+            kind == "error"
+            or kind == "identifier"
+            or kind == "number"
+            or kind == "variable"
+            or kind == "string"
+        then
+            return {
+                kind = kind,
+                text = buffer.readstring(input, start, pos - start),
+                span = vector.create(start, pos, 0),
+            }
+        else
+            return {
+                kind = kind,
+                span = vector.create(start, pos, 0),
+            }
+        end
     end
 
     local token: Token?
     local function peek_token(): Token
-        token = if token == nil then next_token() else token
+        token = if not token then next_token() else token
         return token
     end
 

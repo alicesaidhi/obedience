@@ -38,7 +38,6 @@ export type Expression_Table = {
 
 export type Expression_Function = {
     read kind: "function",
-    read function_token: lex.TokenNoText<"fn">,
     read body: FunctionBody
 }
 
@@ -70,6 +69,14 @@ export type FunctionArg_Number = {
     read token: lex.TokenText<"number">
 }
 
+export type FunctionArg_Boolean = {
+    read kind: "boolean",
+    read token: lex.TokenNoText<"true">
+} | {
+    read kind: "boolean",
+    read token: lex.TokenNoText<"false">
+}
+
 export type FunctionArg_Table = {
     read kind: "table",
     read table: Table
@@ -83,6 +90,7 @@ export type FunctionArg_Expr = {
 export type FunctionArg =
     | FunctionArg_String
     | FunctionArg_Number
+    | FunctionArg_Boolean
     | FunctionArg_Table
     | FunctionArg_Expr
 
@@ -138,7 +146,7 @@ export type Var = {
 
 export type TableField_NameKey = {
     read kind: "namekey",
-    read name: lex.TokenText<"string">,
+    read name: lex.TokenText<"identifier">,
     read value: Expression
 }
 
@@ -164,7 +172,7 @@ export type Table = {
 
 export type FunctionParam = {
     read kind: "param",
-    read token: lex.TokenText<string>
+    read token: lex.TokenText<"identifier">
 }
 
 export type FunctionBody = {
@@ -175,7 +183,7 @@ export type FunctionBody = {
 export type Stat_Assign = {
 	read kind: "assign",
 
-	read left: Var,
+	read left: lex.TokenText<"identifier">,
 	read right: Expression,
 }
 
@@ -191,8 +199,6 @@ export type Stat =
 
 export type Block = {
 	read stats: { Stat },
-
-	read last_expressions: { Expression }?,
 }
 
 export type Ast = {
@@ -203,9 +209,20 @@ export type Ast = {
 
 local function ast(input: buffer): Ast
     local stream = lex(input)
+    local next_token = stream.bump_peek
 
-    local bump_peek = stream.bump_peek
-    local peek = stream.peek
+    local current_token = next_token()
+    local current_kind = current_token.kind
+    local lookahead_token = next_token()
+    local lookahead_kind = lookahead_token.kind
+
+    local function consume()
+        local old_token, old_kind = current_token, current_kind
+        current_token, current_kind = lookahead_token, lookahead_kind
+        lookahead_token = next_token()
+        lookahead_kind = lookahead_token.kind
+        return old_token, old_kind
+    end
 
     local function display(token: lex.Token): string
         local kind = token.kind
@@ -216,8 +233,8 @@ local function ast(input: buffer): Ast
             or kind == "string"
         then
             return kind
-        elseif kind == "attribute" or kind == "error" then
-            return "'" .. (token :: any).text .. "'"
+        elseif token.kind == "error" then
+            return "'" .. token.text .. "'"
         else
             return "'" .. kind .. "'"
         end
@@ -226,62 +243,64 @@ local function ast(input: buffer): Ast
     local function report(message: string, span: vector?): never
         local report = {
             message = message,
-            span = span or peek().span,
+            span = span or current_token.span,
         }
     
         error(report)
     end
 
     local function expect_failure(kind: lex.TokenKindText | lex.TokenKindRest): never
-        return report(`expected {display({ kind = kind } :: any)}, but got {display(peek())} instead`)
+        return report(`expected {display({ kind = kind } :: any)}, but got {display(current_token)} instead`)
     end
 
     local function expect<T>(kind: T & lex.TokenKindRest): lex.TokenNoText<T>
-        if peek().kind == kind :: any then
-            local token = peek()
-            return token :: any
+        if current_kind == kind :: any then
+            return consume() :: any
         else
             return expect_failure(kind)
         end
     end
 
     local function expectwtext<T>(kind: T & lex.TokenKindText): lex.TokenText<T>
-        if peek().kind == kind :: any then
-            local token = peek()
-            return token :: any
+        if current_kind == kind :: any then
+            return consume() :: any
         else
             return expect_failure(kind)
         end
     end
 
+    local function skip_nl()
+        while current_kind == "\n" do consume() end
+    end
+
     local parse_var
     local parse_var_root
-    local parse_var_suffixex
-    local parse_simple_expr
+    local parse_var_suffix
+    local parse_var_suffixes
+    local parse_expr
     local parse_function_arg
     local parse_table
     local parse_expr
+    local parse_block
 
     function parse_var_root(): VarRoot
-        local current_kind = peek().kind
-
         if current_kind == "identifier" then
             return { kind = "global" :: "global", token = expectwtext("identifier") }
         elseif current_kind == "variable" then
             return { kind = "name" :: "name", token = expectwtext("variable") }
         elseif current_kind == "(" then
             expect("(")
+            skip_nl()
             local expr: Expression = parse_expr()
+            skip_nl()
             expect(")")
             return { kind = "paren" :: "paren", expr = expr }
         end
 
-        return report(`expected identifier, variable or (, but got {display(peek())} instead`)
+        return report(`expected identifier, variable or (, but got {display(current_token)} instead`)
     end
 
-    function parse_var_suffix(delimiter: lex.TokenKindRest): VarSuffix
-        local current_kind = peek().kind
-
+    function parse_var_suffix(): VarSuffix
         if current_kind == "." then
             expect(".")
             return { kind = "nameindex" :: "nameindex", name = expectwtext("identifier") }
@@ -292,29 +311,29 @@ local function ast(input: buffer): Ast
             return { kind = "exprindex" :: "exprindex", expr = expression }
         else
             local function_args = {}
-            while peek().kind ~= delimiter or peek().kind == "eof" do
+            while current_kind ~= "eof" and current_kind ~= "\n" and current_kind ~= "." and current_kind ~= "," and current_kind ~= "]" and current_kind ~= "}" and current_kind ~= ")" do
                 table.insert(function_args, parse_function_arg())
             end
-            expect(")")
             return { kind = "call" :: "call", args = function_args }
         end
     end
 
-    function parse_var_suffixes(delimiter: lex.TokenKindRest): { VarSuffix }
+    function parse_var_suffixes(): { VarSuffix }
         local suffixes = {}
 
-        while peek().kind ~= delimiter or peek().kind == "eof" do
-           local suffix = parse_var_suffix(delimiter)
+        skip_nl()
+        while current_kind ~= "eof" and current_kind ~= "." and current_kind ~= "," and current_kind ~= "]" and current_kind ~= "}" and current_kind ~= ")" and current_kind ~= "\n" do
+           local suffix = parse_var_suffix()
            table.insert(suffixes, suffix)
+           skip_nl()
         end
-        expect(delimiter)
 
         return suffixes
     end
 
-    function parse_var(delimiter: lex.TokenKindRest): Var
+    function parse_var(): Var
         local root = parse_var_root()
-        local suffixes = parse_var_suffixes(delimiter)
+        local suffixes = parse_var_suffixes()
 
         return {
             prefix = root,
@@ -323,14 +342,16 @@ local function ast(input: buffer): Ast
     end
 
     function parse_function_arg(): FunctionArg
-        local current_kind = peek().kind
-
         if current_kind == "identifier" then
             return { kind = "string" :: "string", token = expectwtext("identifier") }
         elseif current_kind == "string" then
             return { kind = "string" :: "string", token = expectwtext("string") }
         elseif current_kind == "number" then
             return { kind = "number" :: "number", token = expectwtext("number") }
+        elseif current_kind == "true" then
+            return { kind = "boolean" :: "boolean", token = expect("true") }
+        elseif current_kind == "false" then
+            return { kind = "boolean" :: "boolean", token = expect("false") }
         elseif current_kind == "{" then
             return { kind = "table", table = parse_table() }
         elseif current_kind == "(" then
@@ -338,40 +359,100 @@ local function ast(input: buffer): Ast
             local expression = parse_expr()
             expect(")")
             return { kind = "expression", expr = expression }
-        elseif #current_kind > 1 then
-            return {
-                kind = "string" :: "string",
-                token = { kind = "string" :: "string", text = current_kind :: string, span = peek().span }
-            }
         else
-            return report(`expected identifier, string, table or number, but got {display(peek())}`)
+            return report(`expected identifier, string, table or number, but got {display(current_token)}`)
         end
-    end
-
-    function parse_table_assignment()
-
     end
 
     function parse_table(): Table
-        local fields = {}
+        local fields: { TableField } = {}
         local first = true
 
         expect("{")
+        skip_nl()
         
-        while peek().kind ~= "}" or peek().kind ~= "eof" do
+        while current_kind ~= "}" do
+            skip_nl()
             if first then first = false else expect(",") end
-            
-            
+            skip_nl()
+
+            if current_kind == "identifier" and lookahead_kind == "=" then
+                local key = expectwtext("identifier")
+                expect("=")
+                local expression = parse_expr()
+                local field: TableField_NameKey = {
+                    kind = "namekey",
+                    name = key,
+                    value = expression
+                }
+
+                table.insert(fields, field)
+            elseif current_kind == "[" then
+                expect("[")
+                skip_nl()
+                local key = parse_expr()
+                skip_nl()
+                expect("]")
+                expect("=")
+                local value = parse_expr()
+                skip_nl()
+                local field: TableField_ExprKey = {
+                    kind = "exprkey",
+                    key = key,
+                    value = value
+                }
+
+                table.insert(fields, field)
+            else
+                -- regular index
+                local field: TableField_NoKey = {
+                    kind = "nokey",
+                    value = parse_expr()
+                }
+                skip_nl()
+
+                table.insert(fields, field)
+            end
         end
 
         expect("}")
+
+        return { fields = fields }
     end
 
-    function parse_simple_expr(): Expression
-        local current_kind = peek().kind
+    function parse_function(): FunctionBody
+        skip_nl()
+        expect("(")
+        skip_nl()
 
+        local params: { FunctionParam } = {}
+
+        while current_kind ~= ")" do
+            local token = expectwtext("identifier")
+            local param: FunctionParam = { kind = "param", token = token }
+            table.insert(params, param)
+            skip_nl()
+        end
+
+        expect(")")
+        
+        skip_nl()
+
+        expect("(")
+        skip_nl()
+        local block = parse_block()
+        skip_nl()
+        expect(")")
+        
+        return {
+            params = params,
+            block = block
+        }
+    end
+
+    function parse_expr(): Expression
         if current_kind == "nil" then
-            return { kind = current_kind, token = expect("nil") }
+            return { kind = "nil" :: "nil", token = expect("nil") }
         elseif current_kind == "true" then
             return { kind = "boolean" :: "boolean", token = expect("true") }
         elseif current_kind == "false" then
@@ -380,23 +461,53 @@ local function ast(input: buffer): Ast
             return { kind = "number" :: "number", token = expectwtext("number") }
         elseif current_kind == "string" then
             return { kind = "string" :: "string", token = expectwtext("string") }
-
         elseif current_kind == "identifier" then
-            return { kind = "string" :: "string", token = expectwtext("string") }
+            return { kind = "var", var = parse_var() }
         elseif current_kind == "variable" then
             return { kind = "var", var = parse_var() }
+        elseif current_kind == "fn" then
+            expect("fn")
+            skip_nl()
+            return {
+                kind = "function",
+                body = parse_function()
+            }
+        else
+            return report(`expected expression, got {display(current_token)}`)
         end
-
     end
 
-    function parse_expr(): Expression
-        
+    function parse_block(): Block
+        local statements: { Stat } = {}
+
+        -- there are calls and variable assignments.
+        skip_nl()
+        while current_kind ~= "eof" and current_kind ~= ")" do
+            if current_kind == "identifier" and lookahead_kind == "=" then
+                local key = expectwtext("identifier")
+                expect("=")
+                skip_nl()
+                local value = parse_expr()
+                local statement: Stat_Assign = { kind = "assign", left = key, right = value }
+
+                table.insert(statements, statement)
+            else
+                local statement: Stat_Call = { kind = "call", call = parse_var() }
+
+                table.insert(statements, statement)
+            end
+            skip_nl()
+        end
+
+        return {
+            stats = statements
+        }
     end
 
     return {
-        block = {},
-        eof = peek()
+        block = parse_block(),
+        eof = expect("eof")
     }
 end
 
-return 
+return ast
